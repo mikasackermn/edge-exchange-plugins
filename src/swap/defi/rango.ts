@@ -21,6 +21,7 @@ import {
   SwapBelowLimitError,
   SwapCurrencyError
 } from 'edge-core-js/types'
+import { base64 } from 'rfc4648'
 
 import { div18 } from '../../util/biggystringplus'
 import {
@@ -37,7 +38,7 @@ import {
   makeQueryParams,
   promiseWithTimeout
 } from '../../util/utils'
-import { EdgeSwapRequestPlugin, StringMap } from '../types'
+import { EdgeSwapRequestPlugin, MakeTxParams, StringMap } from '../types'
 import { WEI_MULTIPLIER } from './defiUtils'
 
 const swapInfo: EdgeSwapInfo = {
@@ -77,7 +78,8 @@ const MAINNET_CODE_TRANSCRIPTION: StringMap = {
   // solana: 'SOLANA',
   // tron: 'TRON',
   zksync: 'ZKSYNC',
-  solana: 'SOLANA'
+  solana: 'SOLANA',
+  sui: 'SUI'
 }
 
 const RANGO_SERVERS_DEFAULT = ['https://api.rango.exchange']
@@ -191,11 +193,16 @@ const asSolanaTransaction = asObject({
   serializedMessage: asEither(asArray(asNumber), asNull)
 })
 
+const asSuiTransaction = asObject({
+  type: asValue('SUI'),
+  unsignedPtbBase64: asString
+})
+
 const asSwapResponse = asObject({
   resultType: asRoutingResultType,
   route: asEither(asSwapSimulationResult, asNull),
   error: asEither(asString, asNull),
-  tx: asEither(asEvmTransaction, asSolanaTransaction, asNull)
+  tx: asEither(asEvmTransaction, asSolanaTransaction, asSuiTransaction, asNull)
 })
 
 type ExchangeInfo = ReturnType<typeof asExchangeInfo>
@@ -392,6 +399,18 @@ export function makeRangoPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
 
     let preTx: EdgeTransaction | undefined
     let spendInfo: EdgeSpendInfo
+    const providersStr = providers?.join(' -> ')
+    const metadataNotes = `DEX Providers: ${providersStr}`
+
+    const swapOrderBase = {
+      expirationDate: new Date(Date.now() + EXPIRATION_MS),
+      fromNativeAmount: nativeAmount,
+      metadataNotes,
+      minReceiveAmount: route.outputAmountMin,
+      preTx,
+      request,
+      swapInfo
+    }
 
     switch (tx.type) {
       case 'SOLANA': {
@@ -446,7 +465,43 @@ export function makeRangoPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
 
         break
       }
+      case 'SUI': {
+        const { unsignedPtbBase64 } = asSuiTransaction(tx)
+        if (unsignedPtbBase64 === null) {
+          throw new SwapCurrencyError(swapInfo, request)
+        }
+        const unsignedTx = base64.parse(unsignedPtbBase64)
 
+        const makeTxParams: MakeTxParams = {
+          type: 'MakeTx',
+          unsignedTx,
+          metadata: {
+            assetAction: {
+              assetActionType: 'swap'
+            },
+            savedAction: {
+              actionType: 'swap',
+              swapInfo,
+              isEstimate: true,
+              toAsset: {
+                pluginId: toWallet.currencyInfo.pluginId,
+                tokenId: toTokenId,
+                nativeAmount: route.outputAmount
+              },
+              fromAsset: {
+                pluginId: fromWallet.currencyInfo.pluginId,
+                tokenId: fromTokenId,
+                nativeAmount
+              },
+              payoutAddress: toAddress,
+              payoutWalletId: toWallet.id,
+              refundAddress: fromAddress
+            }
+          }
+        }
+
+        return { ...swapOrderBase, makeTxParams }
+      }
       default: {
         const evmTransaction = asEvmTransaction(tx)
         if (evmTransaction.txData == null) {
@@ -538,19 +593,7 @@ export function makeRangoPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
       }
     }
 
-    const providersStr = providers?.join(' -> ')
-    const metadataNotes = `DEX Providers: ${providersStr}`
-
-    return {
-      expirationDate: new Date(Date.now() + EXPIRATION_MS),
-      fromNativeAmount: nativeAmount,
-      metadataNotes,
-      minReceiveAmount: route.outputAmountMin,
-      preTx,
-      request,
-      spendInfo,
-      swapInfo
-    }
+    return { ...swapOrderBase, spendInfo }
   }
 
   const out: EdgeSwapPlugin = {
