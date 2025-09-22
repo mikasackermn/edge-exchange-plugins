@@ -1,6 +1,7 @@
 import { gte, lte } from 'biggystring'
 import {
   asArray,
+  asBoolean,
   asEither,
   asNull,
   asNumber,
@@ -21,6 +22,7 @@ import {
   SwapBelowLimitError,
   SwapCurrencyError
 } from 'edge-core-js/types'
+import TronWeb from 'tronweb'
 
 import { div18 } from '../../util/biggystringplus'
 import {
@@ -39,6 +41,11 @@ import {
 } from '../../util/utils'
 import { EdgeSwapRequestPlugin, StringMap } from '../types'
 import { WEI_MULTIPLIER } from './defiUtils'
+const {
+  utils: {
+    address: { fromHex }
+  }
+} = TronWeb
 
 const swapInfo: EdgeSwapInfo = {
   pluginId: 'rango',
@@ -77,7 +84,8 @@ const MAINNET_CODE_TRANSCRIPTION: StringMap = {
   // solana: 'SOLANA',
   // tron: 'TRON',
   zksync: 'ZKSYNC',
-  solana: 'SOLANA'
+  solana: 'SOLANA',
+  tron: 'TRON'
 }
 
 const RANGO_SERVERS_DEFAULT = ['https://api.rango.exchange']
@@ -191,11 +199,43 @@ const asSolanaTransaction = asObject({
   serializedMessage: asEither(asArray(asNumber), asNull)
 })
 
+const asTrxContractParameter = asObject({
+  value: asObject({
+    data: asString,
+    owner_address: asString,
+    contract_address: asString,
+    call_value: asNumber
+  }),
+  type_url: asString
+})
+
+const asTrxContractData = asObject({
+  parameter: asTrxContractParameter,
+  type: asString
+})
+
+const asTrxRawData = asObject({
+  contract: asArray(asTrxContractData),
+  ref_block_bytes: asString,
+  ref_block_hash: asString,
+  expiration: asNumber,
+  timestamp: asNumber
+})
+
+const asTronTransaction = asObject({
+  type: asValue('TRON'),
+  raw_data: asEither(asTrxRawData, asNull),
+  raw_data_hex: asEither(asString, asNull),
+  txID: asString,
+  visible: asBoolean,
+  __payload__: asObject
+})
+
 const asSwapResponse = asObject({
   resultType: asRoutingResultType,
   route: asEither(asSwapSimulationResult, asNull),
   error: asEither(asString, asNull),
-  tx: asEither(asEvmTransaction, asSolanaTransaction, asNull)
+  tx: asEither(asEvmTransaction, asSolanaTransaction, asTronTransaction, asNull)
 })
 
 type ExchangeInfo = ReturnType<typeof asExchangeInfo>
@@ -357,6 +397,7 @@ export function makeRangoPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
     }
 
     const swap = asSwapResponse(await swapResponse.json())
+
     const { route, tx } = swap
 
     if (swap.resultType !== 'OK') {
@@ -446,7 +487,55 @@ export function makeRangoPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
 
         break
       }
+      case 'TRON': {
+        const tronTransaction = asTronTransaction(tx)
 
+        if (tronTransaction.raw_data === null) {
+          throw new SwapCurrencyError(swapInfo, request)
+        }
+
+        spendInfo = {
+          tokenId: request.fromTokenId,
+          spendTargets: [
+            {
+              nativeAmount,
+              publicAddress: fromHex(
+                tronTransaction.raw_data.contract[0].parameter.value
+                  .contract_address
+              ),
+              otherParams: {
+                data: tronTransaction.raw_data.contract[0].parameter.value.data
+              }
+            }
+          ],
+          memos: [],
+          networkFeeOption: 'high',
+          assetAction: {
+            assetActionType: 'swap'
+          },
+          savedAction: {
+            actionType: 'swap',
+            swapInfo,
+            orderUri: `${orderUri}${toAddress}`,
+            isEstimate: true,
+            toAsset: {
+              pluginId: toWallet.currencyInfo.pluginId,
+              tokenId: toTokenId,
+              nativeAmount: route.outputAmount
+            },
+            fromAsset: {
+              pluginId: fromWallet.currencyInfo.pluginId,
+              tokenId: fromTokenId,
+              nativeAmount: nativeAmount
+            },
+            payoutAddress: toAddress,
+            payoutWalletId: toWallet.id,
+            refundAddress: fromAddress
+          }
+        }
+
+        break
+      }
       default: {
         const evmTransaction = asEvmTransaction(tx)
         if (evmTransaction.txData == null) {
